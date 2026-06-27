@@ -6,7 +6,17 @@ import tkinter as tk
 from tkinter import ttk
 import threading
 import socket
+import os, sys, json, datetime
 import sounddevice as sd
+
+# Resolve directory next to the exe (frozen) or script (dev)
+_app_dir     = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__))
+_log_path    = os.path.join(_app_dir, 'rotor.log')
+_config_path = os.path.join(_app_dir, 'rotor.json')
+
+def _log(msg: str):
+    with open(_log_path, 'a', encoding='utf-8') as f:
+        f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
 # server and client use Windows-only ctypes.windll — import lazily at runtime
 _server = _client = None
 
@@ -49,7 +59,9 @@ class RotorUI:
         self._running     = False
         self._thread      = None
         self._audio_devs  = []
+        self._saved_audio = ''
         self._build()
+        self._load_config()
 
     def _build(self):
         p = {'padx': 8, 'pady': 4}
@@ -132,11 +144,15 @@ class RotorUI:
         names = [name for name, _ in self._audio_devs]
         self._audio_combo['values'] = names
         if names:
-            self._audio_combo.current(0)
+            if self._saved_audio in names:
+                self._audio_combo.current(names.index(self._saved_audio))
+            else:
+                self._audio_combo.current(0)
         else:
             self.audio_var.set('(none found)')
 
     def _set_status(self, msg: str):
+        _log(msg)
         ml = msg.lower()
         if 'connected' in ml:
             color = '#2d7d46'
@@ -148,6 +164,32 @@ class RotorUI:
             color = 'gray'
         self.root.after(0, self._status.set, msg)
         self.root.after(0, self._status_lbl.config, {'foreground': color})
+
+    def _load_config(self):
+        try:
+            with open(_config_path, encoding='utf-8') as f:
+                c = json.load(f)
+            self.mode.set(c.get('mode', 'server'))
+            self.ip.set(c.get('ip', ''))
+            self.direction.set(c.get('direction', 'right'))
+            self.block_fs.set(c.get('block_fs', True))
+            self._saved_audio = c.get('audio', '')
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            self._saved_audio = ''
+        self._on_mode_change()   # re-apply mode (hides/shows IP row, refreshes audio)
+
+    def _save_config(self):
+        try:
+            with open(_config_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'mode':      self.mode.get(),
+                    'ip':        self.ip.get(),
+                    'audio':     self.audio_var.get(),
+                    'direction': self.direction.get(),
+                    'block_fs':  self.block_fs.get(),
+                }, f, indent=2)
+        except OSError:
+            pass
 
     def _selected_audio_index(self):
         sel = self._audio_combo.current()
@@ -193,6 +235,7 @@ class RotorUI:
             }
             target = lambda: _client.start(config, on_status=self._set_status)
 
+        self._save_config()
         self._running = True
         self._btn.config(text='Stop')
         self._thread = threading.Thread(target=target, daemon=True)

@@ -10,6 +10,7 @@ config keys:
 """
 import ctypes, ctypes.wintypes as wt, socket, threading, json, sys
 import sounddevice as sd
+import numpy as np
 
 u32 = ctypes.windll.user32
 
@@ -155,13 +156,21 @@ def _audio_thread():
     dev = _cfg.get('audio_device')
     if dev is None:
         return
-    ip   = _cfg['server_ip']
-    port = _cfg.get('audio_port', 9001)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ip      = _cfg['server_ip']
+    port    = _cfg.get('audio_port', 9001)
+    src_ch  = sd.query_devices(dev)['max_input_channels']
+    sock    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         def cb(indata, frames, t, status):
-            sock.sendto(bytes(indata), (ip, port))
-        with sd.InputStream(device=dev, channels=2, samplerate=48000,
+            # normalize to stereo so the server always receives 2-channel data
+            if src_ch == 1:
+                out = np.repeat(indata, 2, axis=1)
+            elif src_ch > 2:
+                out = indata[:, :2].copy()
+            else:
+                out = indata
+            sock.sendto(bytes(out), (ip, port))
+        with sd.InputStream(device=dev, channels=src_ch, samplerate=48000,
                             dtype='int16', blocksize=960, callback=cb):
             _stop.wait()
     except Exception as e:
