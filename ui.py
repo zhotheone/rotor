@@ -5,6 +5,7 @@ Run: python ui.py
 import tkinter as tk
 from tkinter import ttk
 import threading
+import socket
 import sounddevice as sd
 # server and client use Windows-only ctypes.windll — import lazily at runtime
 _server = _client = None
@@ -55,61 +56,73 @@ class RotorUI:
         f = ttk.Frame(self.root, padding=14)
         f.grid()
 
+        # ── Local IP ──────────────────────────────────────────────────────────
+        local_ip = socket.gethostbyname(socket.gethostname())
+        ttk.Label(f, text='This machine:').grid(row=0, column=0, sticky='w', **p)
+        ttk.Label(f, text=local_ip, foreground='#2d7d46').grid(row=0, column=1, sticky='w', **p)
+
         # ── Mode ──────────────────────────────────────────────────────────────
-        ttk.Label(f, text='Mode:').grid(row=0, column=0, sticky='w', **p)
+        ttk.Label(f, text='Mode:').grid(row=1, column=0, sticky='w', **p)
         self.mode = tk.StringVar(value='server')
         mf = ttk.Frame(f)
-        mf.grid(row=0, column=1, sticky='w', **p)
+        mf.grid(row=1, column=1, sticky='w', **p)
         for label, val in (('Server', 'server'), ('Client', 'client')):
             ttk.Radiobutton(mf, text=label, variable=self.mode, value=val,
                             command=self._on_mode_change).pack(side='left', padx=(0, 8))
 
         # ── IP ────────────────────────────────────────────────────────────────
-        self._ip_label = ttk.Label(f, text='Client IP:')
-        self._ip_label.grid(row=1, column=0, sticky='w', **p)
+        self._ip_label = ttk.Label(f, text='Server IP:')
+        self._ip_label.grid(row=2, column=0, sticky='w', **p)
         self.ip = tk.StringVar()
-        ttk.Entry(f, textvariable=self.ip, width=22).grid(row=1, column=1, sticky='w', **p)
+        self._ip_entry = ttk.Entry(f, textvariable=self.ip, width=22)
+        self._ip_entry.grid(row=2, column=1, sticky='w', **p)
 
         # ── Audio device ──────────────────────────────────────────────────────
-        ttk.Label(f, text='Audio:').grid(row=2, column=0, sticky='w', **p)
+        ttk.Label(f, text='Audio:').grid(row=3, column=0, sticky='w', **p)
         self.audio_var   = tk.StringVar()
         self._audio_combo = ttk.Combobox(f, textvariable=self.audio_var,
                                          width=32, state='readonly')
-        self._audio_combo.grid(row=2, column=1, sticky='w', **p)
+        self._audio_combo.grid(row=3, column=1, sticky='w', **p)
 
         # ── Layout direction ──────────────────────────────────────────────────
-        ttk.Label(f, text='Client is to the:').grid(row=3, column=0, sticky='w', **p)
+        ttk.Label(f, text='Client is to the:').grid(row=4, column=0, sticky='w', **p)
         self.direction = tk.StringVar(value='right')
         ttk.Combobox(f, textvariable=self.direction, width=10, state='readonly',
                      values=['right', 'left', 'top', 'bottom']).grid(
-                     row=3, column=1, sticky='w', **p)
+                     row=4, column=1, sticky='w', **p)
 
         # ── Fullscreen guard ──────────────────────────────────────────────────
         self.block_fs = tk.BooleanVar(value=True)
         self._fs_check = ttk.Checkbutton(f, text='Block KVM switch in fullscreen',
                                          variable=self.block_fs)
-        self._fs_check.grid(row=4, column=0, columnspan=2, sticky='w', **p)
+        self._fs_check.grid(row=5, column=0, columnspan=2, sticky='w', **p)
 
         # ── Separator ─────────────────────────────────────────────────────────
         ttk.Separator(f, orient='horizontal').grid(
-            row=5, column=0, columnspan=2, sticky='ew', pady=6)
+            row=6, column=0, columnspan=2, sticky='ew', pady=6)
 
         # ── Start / Stop ──────────────────────────────────────────────────────
         self._btn = ttk.Button(f, text='Start', command=self._toggle, width=12)
-        self._btn.grid(row=6, column=0, columnspan=2, pady=(2, 6))
+        self._btn.grid(row=7, column=0, columnspan=2, pady=(2, 6))
 
         # ── Status ────────────────────────────────────────────────────────────
-        self._status = tk.StringVar(value='Idle')
-        ttk.Label(f, textvariable=self._status, foreground='gray',
-                  wraplength=280).grid(row=7, column=0, columnspan=2, sticky='w', **p)
+        self._status = tk.StringVar(value='Offline')
+        self._status_lbl = ttk.Label(f, textvariable=self._status, foreground='gray',
+                                     wraplength=280)
+        self._status_lbl.grid(row=8, column=0, columnspan=2, sticky='w', **p)
 
-        self._refresh_audio()
+        self._on_mode_change()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _on_mode_change(self):
         m = self.mode.get()
-        self._ip_label.config(text='Client IP:' if m == 'server' else 'Server IP:')
+        if m == 'server':
+            self._ip_label.grid_remove()
+            self._ip_entry.grid_remove()
+        else:
+            self._ip_label.grid()
+            self._ip_entry.grid()
         # fullscreen guard only meaningful on server
         self._fs_check.state(['!disabled'] if m == 'server' else ['disabled'])
         self._refresh_audio()
@@ -124,7 +137,17 @@ class RotorUI:
             self.audio_var.set('(none found)')
 
     def _set_status(self, msg: str):
+        ml = msg.lower()
+        if 'connected' in ml:
+            color = '#2d7d46'
+        elif 'waiting' in ml or 'running' in ml:
+            color = '#d97706'
+        elif any(w in ml for w in ('error', 'windows only', 'enter')):
+            color = '#dc2626'
+        else:
+            color = 'gray'
         self.root.after(0, self._status.set, msg)
+        self.root.after(0, self._status_lbl.config, {'foreground': color})
 
     def _selected_audio_index(self):
         sel = self._audio_combo.current()
@@ -141,12 +164,11 @@ class RotorUI:
             self._do_start()
 
     def _do_start(self):
-        ip = self.ip.get().strip()
-        if not ip:
+        m   = self.mode.get()
+        ip  = self.ip.get().strip()
+        if not ip and m != 'server':
             self._set_status('Enter an IP address.')
             return
-
-        m   = self.mode.get()
         dev = self._selected_audio_index()
 
         try:
@@ -183,7 +205,7 @@ class RotorUI:
             _client.stop()
         self._running = False
         self._btn.config(text='Start')
-        self._set_status('Stopped.')
+        self._set_status('Offline.')
 
     # ── Run ───────────────────────────────────────────────────────────────────
 

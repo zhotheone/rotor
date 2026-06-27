@@ -219,11 +219,11 @@ def _kvm_server():
     srv.settimeout(1.0)
     srv.bind(('', port))
     srv.listen(1)
-    _notify(f'Waiting for client on :{port}…')
     while not _stop.is_set():
         try:
             conn, addr = srv.accept()
-            _notify(f'Client connected: {addr[0]}')
+            _cfg['client_ip'] = addr[0]
+            _notify(f'Connected to {addr[0]}')
             _conn = conn
         except socket.timeout:
             pass
@@ -273,8 +273,9 @@ def start(config: dict, on_status=None):
     _hook_ready.clear()
     for fn in (_kvm_server, _kvm_sender, _kvm_receiver, _audio_thread):
         threading.Thread(target=fn, daemon=True).start()
+    local_ip = socket.gethostbyname(socket.gethostname())
     d = config.get('direction', 'right')
-    _notify(f'Rotor server ready — move cursor to {d} edge to activate KVM.')
+    _notify(f'Server running on {local_ip} — waiting for connection…')
     _hook_loop()   # blocks until stop() posts WM_QUIT
 
 def stop():
