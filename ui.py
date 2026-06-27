@@ -1,0 +1,201 @@
+"""Rotor UI — configure and launch server or client mode.
+
+Run: python ui.py
+"""
+import tkinter as tk
+from tkinter import ttk
+import threading
+import sounddevice as sd
+# server and client use Windows-only ctypes.windll — import lazily at runtime
+_server = _client = None
+
+def _load_modules():
+    global _server, _client
+    if _server is None:
+        import server as s, client as c
+        _server, _client = s, c
+
+
+# ── Audio device helpers ─────────────────────────────────────────────────────
+
+def _audio_devices(mode: str):
+    """Return [(label, device_index)] appropriate for the given mode."""
+    try:
+        wasapi = next(i for i, h in enumerate(sd.query_hostapis()) if 'WASAPI' in h['name'])
+    except StopIteration:
+        wasapi = None
+
+    out = []
+    for i, d in enumerate(sd.query_devices()):
+        if mode == 'server':
+            # Only WASAPI input devices (loopback) for capturing system audio
+            if d['hostapi'] == wasapi and d['max_input_channels'] > 0:
+                out.append((d['name'], i))
+        else:
+            # Any output device for playback
+            if d['max_output_channels'] > 0:
+                out.append((d['name'], i))
+    return out
+
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+class RotorUI:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title('Rotor')
+        self.root.resizable(False, False)
+        self._running     = False
+        self._thread      = None
+        self._audio_devs  = []
+        self._build()
+
+    def _build(self):
+        p = {'padx': 8, 'pady': 4}
+        f = ttk.Frame(self.root, padding=14)
+        f.grid()
+
+        # ── Mode ──────────────────────────────────────────────────────────────
+        ttk.Label(f, text='Mode:').grid(row=0, column=0, sticky='w', **p)
+        self.mode = tk.StringVar(value='server')
+        mf = ttk.Frame(f)
+        mf.grid(row=0, column=1, sticky='w', **p)
+        for label, val in (('Server', 'server'), ('Client', 'client')):
+            ttk.Radiobutton(mf, text=label, variable=self.mode, value=val,
+                            command=self._on_mode_change).pack(side='left', padx=(0, 8))
+
+        # ── IP ────────────────────────────────────────────────────────────────
+        self._ip_label = ttk.Label(f, text='Client IP:')
+        self._ip_label.grid(row=1, column=0, sticky='w', **p)
+        self.ip = tk.StringVar()
+        ttk.Entry(f, textvariable=self.ip, width=22).grid(row=1, column=1, sticky='w', **p)
+
+        # ── Audio device ──────────────────────────────────────────────────────
+        ttk.Label(f, text='Audio:').grid(row=2, column=0, sticky='w', **p)
+        self.audio_var   = tk.StringVar()
+        self._audio_combo = ttk.Combobox(f, textvariable=self.audio_var,
+                                         width=32, state='readonly')
+        self._audio_combo.grid(row=2, column=1, sticky='w', **p)
+
+        # ── Layout direction ──────────────────────────────────────────────────
+        ttk.Label(f, text='Client is to the:').grid(row=3, column=0, sticky='w', **p)
+        self.direction = tk.StringVar(value='right')
+        ttk.Combobox(f, textvariable=self.direction, width=10, state='readonly',
+                     values=['right', 'left', 'top', 'bottom']).grid(
+                     row=3, column=1, sticky='w', **p)
+
+        # ── Fullscreen guard ──────────────────────────────────────────────────
+        self.block_fs = tk.BooleanVar(value=True)
+        self._fs_check = ttk.Checkbutton(f, text='Block KVM switch in fullscreen',
+                                         variable=self.block_fs)
+        self._fs_check.grid(row=4, column=0, columnspan=2, sticky='w', **p)
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        ttk.Separator(f, orient='horizontal').grid(
+            row=5, column=0, columnspan=2, sticky='ew', pady=6)
+
+        # ── Start / Stop ──────────────────────────────────────────────────────
+        self._btn = ttk.Button(f, text='Start', command=self._toggle, width=12)
+        self._btn.grid(row=6, column=0, columnspan=2, pady=(2, 6))
+
+        # ── Status ────────────────────────────────────────────────────────────
+        self._status = tk.StringVar(value='Idle')
+        ttk.Label(f, textvariable=self._status, foreground='gray',
+                  wraplength=280).grid(row=7, column=0, columnspan=2, sticky='w', **p)
+
+        self._refresh_audio()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _on_mode_change(self):
+        m = self.mode.get()
+        self._ip_label.config(text='Client IP:' if m == 'server' else 'Server IP:')
+        # fullscreen guard only meaningful on server
+        self._fs_check.state(['!disabled'] if m == 'server' else ['disabled'])
+        self._refresh_audio()
+
+    def _refresh_audio(self):
+        self._audio_devs = _audio_devices(self.mode.get())
+        names = [name for name, _ in self._audio_devs]
+        self._audio_combo['values'] = names
+        if names:
+            self._audio_combo.current(0)
+        else:
+            self.audio_var.set('(none found)')
+
+    def _set_status(self, msg: str):
+        self.root.after(0, self._status.set, msg)
+
+    def _selected_audio_index(self):
+        sel = self._audio_combo.current()
+        if sel >= 0 and sel < len(self._audio_devs):
+            return self._audio_devs[sel][1]
+        return None
+
+    # ── Start / Stop ──────────────────────────────────────────────────────────
+
+    def _toggle(self):
+        if self._running:
+            self._do_stop()
+        else:
+            self._do_start()
+
+    def _do_start(self):
+        ip = self.ip.get().strip()
+        if not ip:
+            self._set_status('Enter an IP address.')
+            return
+
+        m   = self.mode.get()
+        dev = self._selected_audio_index()
+
+        try:
+            _load_modules()
+        except (AttributeError, OSError) as e:
+            self._set_status(f'Windows only: {e}')
+            return
+
+        if m == 'server':
+            config = {
+                'client_ip':        ip,
+                'audio_device':     dev,
+                'direction':        self.direction.get(),
+                'block_fullscreen': self.block_fs.get(),
+            }
+            target = lambda: _server.start(config, on_status=self._set_status)
+        else:
+            config = {
+                'server_ip':    ip,
+                'audio_device': dev,
+                'direction':    self.direction.get(),
+            }
+            target = lambda: _client.start(config, on_status=self._set_status)
+
+        self._running = True
+        self._btn.config(text='Stop')
+        self._thread = threading.Thread(target=target, daemon=True)
+        self._thread.start()
+
+    def _do_stop(self):
+        if self.mode.get() == 'server':
+            _server.stop()
+        else:
+            _client.stop()
+        self._running = False
+        self._btn.config(text='Start')
+        self._set_status('Stopped.')
+
+    # ── Run ───────────────────────────────────────────────────────────────────
+
+    def run(self):
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.root.mainloop()
+
+    def _on_close(self):
+        if self._running:
+            self._do_stop()
+        self.root.destroy()
+
+
+if __name__ == '__main__':
+    RotorUI().run()
