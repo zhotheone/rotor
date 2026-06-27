@@ -28,12 +28,12 @@ def _audio_devices(mode: str):
 
     out = []
     for i, d in enumerate(sd.query_devices()):
-        if mode == 'server':
+        if mode == 'client':
             # Only WASAPI input devices (loopback) for capturing system audio
             if d['hostapi'] == wasapi and d['max_input_channels'] > 0:
                 out.append((d['name'], i))
         else:
-            # Any output device for playback
+            # Any output device for playback received audio
             if d['max_output_channels'] > 0:
                 out.append((d['name'], i))
     return out

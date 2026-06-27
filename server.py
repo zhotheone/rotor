@@ -11,6 +11,7 @@ config keys:
 """
 import ctypes, ctypes.wintypes as wt, socket, threading, json, sys, queue
 import sounddevice as sd
+import numpy as np
 
 u32 = ctypes.windll.user32
 k32 = ctypes.windll.kernel32
@@ -62,7 +63,6 @@ _cfg       = {}
 _active    = False          # KVM pass-through on/off
 _conn      = None           # current TCP client socket
 _kvm_q     = queue.SimpleQueue()
-_audio_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 _stop      = threading.Event()
 _hook_tid  = None
 _hook_ready= threading.Event()
@@ -230,19 +230,24 @@ def _kvm_server():
     srv.close()
 
 def _audio_thread():
-    dev = _cfg.get('audio_device')
-    if dev is None:
-        return
-    try:
-        def cb(indata, frames, t, status):
-            if _active:
-                _audio_udp.sendto(bytes(indata),
-                                  (_cfg['client_ip'], _cfg.get('audio_port', 9001)))
-        with sd.InputStream(device=dev, channels=2, samplerate=48000,
-                            dtype='int16', blocksize=960, callback=cb):
-            _stop.wait()
-    except Exception as e:
-        _notify(f'Audio error: {e}')
+    dev  = _cfg.get('audio_device')
+    port = _cfg.get('audio_port', 9001)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('', port))
+    sock.settimeout(1.0)
+    stream = sd.OutputStream(device=dev, channels=2, samplerate=48000,
+                              dtype='int16', blocksize=960)
+    stream.start()
+    while not _stop.is_set():
+        try:
+            data, _ = sock.recvfrom(960 * 4)
+            stream.write(np.frombuffer(data, dtype='int16').reshape(-1, 2))
+        except socket.timeout:
+            pass
+        except Exception:
+            pass
+    stream.stop()
+    sock.close()
 
 # ── Hook message loop (must run on the thread that installs the hooks) ────────
 def _hook_loop():

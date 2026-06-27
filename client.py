@@ -5,12 +5,11 @@ As module:  import client; client.start(config, on_status=fn); client.stop()
 
 config keys:
   server_ip     str   server machine IP
-  audio_device  int   sounddevice output device index (None = system default)
+  audio_device  int   sounddevice input device index (WASAPI loopback, None = disabled)
   direction     str   'right'|'left'|'top'|'bottom' — same as server setting
 """
 import ctypes, ctypes.wintypes as wt, socket, threading, json, sys
 import sounddevice as sd
-import numpy as np
 
 u32 = ctypes.windll.user32
 
@@ -153,25 +152,22 @@ def _kvm_client():
 
 # ── Audio receiver ────────────────────────────────────────────────────────────
 def _audio_thread():
+    dev = _cfg.get('audio_device')
+    if dev is None:
+        return
+    ip   = _cfg['server_ip']
     port = _cfg.get('audio_port', 9001)
-    dev  = _cfg.get('audio_device')   # None = sounddevice picks default output
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(('', port))
-    sock.settimeout(1.0)
-    stream = sd.OutputStream(device=dev, channels=2, samplerate=48000,
-                              dtype='int16', blocksize=960)
-    stream.start()
-    _notify(f'Audio listening on :{port}')
-    while not _stop.is_set():
-        try:
-            data, _ = sock.recvfrom(960 * 4)   # 960 frames × 2 ch × 2 bytes
-            stream.write(np.frombuffer(data, dtype='int16').reshape(-1, 2))
-        except socket.timeout:
-            pass
-        except Exception:
-            pass
-    stream.stop()
-    sock.close()
+    try:
+        def cb(indata, frames, t, status):
+            sock.sendto(bytes(indata), (ip, port))
+        with sd.InputStream(device=dev, channels=2, samplerate=48000,
+                            dtype='int16', blocksize=960, callback=cb):
+            _stop.wait()
+    except Exception as e:
+        _notify(f'Audio error: {e}')
+    finally:
+        sock.close()
 
 # ── Public API ───────────────────────────────────────────────────────────────
 def start(config: dict, on_status=None):
