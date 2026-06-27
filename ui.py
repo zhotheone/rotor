@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import ttk
 import threading
 import socket
-import os, sys, json, datetime
+import os, sys, json, logging
 import sounddevice as sd
 
 # Resolve directory next to the exe (frozen) or script (dev)
@@ -14,9 +14,14 @@ _app_dir     = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) e
 _log_path    = os.path.join(_app_dir, 'rotor.log')
 _config_path = os.path.join(_app_dir, 'rotor.json')
 
-def _log(msg: str):
-    with open(_log_path, 'a', encoding='utf-8') as f:
-        f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+logging.basicConfig(
+    filename=_log_path,
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)-5s %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    encoding='utf-8',
+)
+_log = logging.getLogger('ui')
 # server and client use Windows-only ctypes.windll — import lazily at runtime
 _server = _client = None
 
@@ -89,8 +94,9 @@ class RotorUI:
         self._ip_entry = ttk.Entry(f, textvariable=self.ip, width=22)
         self._ip_entry.grid(row=2, column=1, sticky='w', **p)
 
-        # ── Audio device ──────────────────────────────────────────────────────
-        ttk.Label(f, text='Audio:').grid(row=3, column=0, sticky='w', **p)
+        # ── Audio device (server only — client auto-detects loopback) ────────
+        self._audio_label = ttk.Label(f, text='Audio:')
+        self._audio_label.grid(row=3, column=0, sticky='w', **p)
         self.audio_var   = tk.StringVar()
         self._audio_combo = ttk.Combobox(f, textvariable=self.audio_var,
                                          width=32, state='readonly')
@@ -132,9 +138,13 @@ class RotorUI:
         if m == 'server':
             self._ip_label.grid_remove()
             self._ip_entry.grid_remove()
+            self._audio_label.grid()
+            self._audio_combo.grid()
         else:
             self._ip_label.grid()
             self._ip_entry.grid()
+            self._audio_label.grid_remove()
+            self._audio_combo.grid_remove()
         # fullscreen guard only meaningful on server
         self._fs_check.state(['!disabled'] if m == 'server' else ['disabled'])
         self._refresh_audio()
@@ -152,7 +162,7 @@ class RotorUI:
             self.audio_var.set('(none found)')
 
     def _set_status(self, msg: str):
-        _log(msg)
+        _log.info(msg)
         ml = msg.lower()
         if 'connected' in ml:
             color = '#2d7d46'
@@ -229,9 +239,8 @@ class RotorUI:
             target = lambda: _server.start(config, on_status=self._set_status)
         else:
             config = {
-                'server_ip':    ip,
-                'audio_device': dev,
-                'direction':    self.direction.get(),
+                'server_ip': ip,
+                'direction': self.direction.get(),
             }
             target = lambda: _client.start(config, on_status=self._set_status)
 

@@ -9,9 +9,11 @@ config keys:
   direction        str   'right'|'left'|'top'|'bottom' — where client screen is
   block_fullscreen bool  don't trigger KVM when a fullscreen window is focused
 """
-import ctypes, ctypes.wintypes as wt, socket, threading, json, sys, queue
+import ctypes, ctypes.wintypes as wt, socket, threading, json, sys, queue, time, logging
 import sounddevice as sd
 import numpy as np
+
+_log = logging.getLogger('server')
 
 u32 = ctypes.windll.user32
 k32 = ctypes.windll.kernel32
@@ -69,9 +71,10 @@ _hook_ready= threading.Event()
 _kb_fn     = None           # keep HOOKPROC refs alive (ctypes requirement)
 _ms_fn     = None
 _status_cb = None
+_last_edge_log = 0.0        # throttle edge-trigger debug spam
 
 def _notify(msg: str):
-    print(msg)
+    _log.info(msg)
     if _status_cb:
         _status_cb(msg)
 
@@ -80,9 +83,16 @@ def _screen():
     # ponytail: primary monitor only; for multi-monitor servers use SM_CXVIRTUALSCREEN
     return u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
 
+_GWL_STYLE  = -16
+_WS_CAPTION = 0x00C00000
+
 def _is_fullscreen() -> bool:
     hwnd = u32.GetForegroundWindow()
-    if not hwnd:
+    # shell/desktop window covers the full screen but isn't a real fullscreen app
+    if not hwnd or hwnd == u32.GetShellWindow():
+        return False
+    # maximized normal windows have WS_CAPTION; real fullscreen apps (games) don't
+    if u32.GetWindowLongW(hwnd, _GWL_STYLE) & _WS_CAPTION:
         return False
     r = wt.RECT()
     u32.GetWindowRect(hwnd, ctypes.byref(r))
@@ -144,18 +154,27 @@ _BTN = {WM_LBUTTONDOWN: 'ld', WM_LBUTTONUP: 'lu',
         WM_MBUTTONDOWN: 'md', WM_MBUTTONUP: 'mu'}
 
 def _ms_hook(nCode, wParam, lParam):
+    global _last_edge_log
     if nCode >= 0:
         s = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
         if not (s.flags & LLMHF_INJECTED):
             x, y = s.pt.x, s.pt.y
             if not _active:
-                if _at_trigger_edge(x, y) and _conn:
-                    if _cfg.get('block_fullscreen', True) and _is_fullscreen():
-                        pass   # don't trigger inside a fullscreen/windowed-fullscreen app
-                    else:
-                        _set_active(True)
-                        _warp(*_lock_xy())
-                        return 1
+                if _at_trigger_edge(x, y):
+                    now = time.monotonic()
+                    if now - _last_edge_log > 1.0:
+                        _last_edge_log = now
+                        if not _conn:
+                            _log.debug(f'Edge hit at ({x},{y}) — no client connected')
+                        elif _cfg.get('block_fullscreen', True) and _is_fullscreen():
+                            _log.debug(f'Edge hit at ({x},{y}) — blocked by fullscreen')
+                    if _conn:
+                        if _cfg.get('block_fullscreen', True) and _is_fullscreen():
+                            pass
+                        else:
+                            _set_active(True)
+                            _warp(*_lock_xy())
+                            return 1
             else:
                 lx, ly = _lock_xy()
                 if wParam == WM_MOUSEMOVE:
@@ -183,7 +202,10 @@ def _kvm_sender():
         if c:
             try:
                 c.sendall(json.dumps(ev).encode() + b'\n')
-            except OSError:
+                if ev.get('t') not in ('mm',):   # skip spammy mouse-move
+                    _log.debug(f'Sent event: {ev}')
+            except OSError as e:
+                _log.warning(f'TCP send failed: {e}')
                 _conn = None
 
 def _kvm_receiver():
@@ -204,7 +226,9 @@ def _kvm_receiver():
                     line, buf = buf.split(b'\n', 1)
                     if line:
                         try:
-                            if json.loads(line).get('t') == 'release' and _active:
+                            ev = json.loads(line)
+                            if ev.get('t') == 'release' and _active:
+                                _log.debug('Release received from client')
                                 _set_active(False)
                         except json.JSONDecodeError:
                             pass
@@ -231,6 +255,8 @@ def _kvm_server():
 
 def _audio_thread():
     dev  = _cfg.get('audio_device')
+    if dev is None:
+        return
     port = _cfg.get('audio_port', 9001)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('', port))
@@ -258,6 +284,7 @@ def _hook_loop():
     hmod = k32.GetModuleHandleW(None)
     hkb  = u32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_fn, hmod, 0)
     hms  = u32.SetWindowsHookExW(WH_MOUSE_LL,    _ms_fn, hmod, 0)
+    _log.debug(f'Hooks installed: kb={hkb} ms={hms}')
     _hook_ready.set()
     msg = wt.MSG()
     while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:

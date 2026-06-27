@@ -8,9 +8,11 @@ config keys:
   audio_device  int   sounddevice input device index (WASAPI loopback, None = disabled)
   direction     str   'right'|'left'|'top'|'bottom' — same as server setting
 """
-import ctypes, ctypes.wintypes as wt, socket, threading, json, sys
+import ctypes, ctypes.wintypes as wt, socket, threading, json, sys, logging
 import sounddevice as sd
 import numpy as np
+
+_log = logging.getLogger('client')
 
 u32 = ctypes.windll.user32
 
@@ -52,15 +54,18 @@ _stop      = threading.Event()
 _status_cb = None
 
 def _notify(msg: str):
-    print(msg)
+    _log.info(msg)
     if _status_cb:
         _status_cb(msg)
 
 # ── Input injection ──────────────────────────────────────────────────────────
 def _send(inp: INPUT):
-    u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    if u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) != 1:
+        _log.warning('SendInput returned 0 — injection blocked (UAC/elevated window?)')
 
 def handle(ev: dict):
+    if ev.get('t') not in ('mm',):   # skip spammy mouse-move
+        _log.debug(f'Handle event: {ev}')
     t = ev.get('t')
     if t in ('kd', 'ku'):
         i = INPUT(type=1)
@@ -104,6 +109,7 @@ def _edge_watcher():
     while not _stop.is_set():
         u32.GetCursorPos(ctypes.byref(p))
         if _at_return_edge(p.x, p.y):
+            _log.debug(f'Return edge at ({p.x},{p.y}), sending release')
             s = _sock
             if s:
                 try:
@@ -127,9 +133,11 @@ def _kvm_client():
             s.connect((ip, port))
             s.settimeout(None)
             _sock = s
+            _log.debug(f'TCP connected to {ip}:{port}')
             _notify('KVM ready.')
             break
-        except (ConnectionRefusedError, socket.timeout, OSError):
+        except (ConnectionRefusedError, socket.timeout, OSError) as e:
+            _log.debug(f'Connect attempt failed: {e}')
             _stop.wait(1)
     if _stop.is_set():
         return
@@ -151,17 +159,34 @@ def _kvm_client():
                 except (json.JSONDecodeError, KeyError):
                     pass
 
-# ── Audio receiver ────────────────────────────────────────────────────────────
+# ── Audio capture → server ────────────────────────────────────────────────────
+def _find_loopback():
+    """Return (device_index, name) for the first WASAPI loopback input device."""
+    try:
+        wasapi = next(i for i, h in enumerate(sd.query_hostapis()) if 'WASAPI' in h['name'])
+    except StopIteration:
+        return None, 'no WASAPI host'
+    for i, d in enumerate(sd.query_devices()):
+        if d['hostapi'] == wasapi and d['max_input_channels'] > 0:
+            return i, d['name']
+    return None, 'no loopback device found'
+
 def _audio_thread():
-    dev = _cfg.get('audio_device')
+    dev, dev_name = _find_loopback()
     if dev is None:
+        _notify(f'Audio disabled: {dev_name}')
         return
-    ip      = _cfg['server_ip']
-    port    = _cfg.get('audio_port', 9001)
-    src_ch  = sd.query_devices(dev)['max_input_channels']
-    sock    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ip         = _cfg['server_ip']
+    port       = _cfg.get('audio_port', 9001)
+    dev_info   = sd.query_devices(dev)
+    src_ch     = dev_info['max_input_channels']
+    samplerate = int(dev_info['default_samplerate'])
+    _log.debug(f'Audio loopback: "{dev_name}" idx={dev} ch={src_ch} rate={samplerate}')
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         def cb(indata, frames, t, status):
+            if status:
+                _log.debug(f'Audio stream status: {status}')
             # normalize to stereo so the server always receives 2-channel data
             if src_ch == 1:
                 out = np.repeat(indata, 2, axis=1)
@@ -170,7 +195,8 @@ def _audio_thread():
             else:
                 out = indata
             sock.sendto(bytes(out), (ip, port))
-        with sd.InputStream(device=dev, channels=src_ch, samplerate=48000,
+        _notify(f'Audio: streaming "{dev_name}" → {ip}:{port}')
+        with sd.InputStream(device=dev, channels=src_ch, samplerate=samplerate,
                             dtype='int16', blocksize=960, callback=cb):
             _stop.wait()
     except Exception as e:
