@@ -12,6 +12,18 @@ import ctypes, ctypes.wintypes as wt, socket, threading, json, sys, logging
 import sounddevice as sd
 import numpy as np
 
+from protocol import (
+    AUDIO_BLOCK_FRAMES,
+    AUDIO_CHANNELS,
+    AUDIO_DTYPE,
+    AUDIO_SAMPLERATE,
+    DEFAULT_AUDIO_PORT,
+    DEFAULT_KVM_PORT,
+    Direction,
+    EventType,
+    MouseButton,
+)
+
 _log = logging.getLogger('client')
 
 u32 = ctypes.windll.user32
@@ -43,9 +55,14 @@ class INPUT(ctypes.Structure):
     _anonymous_ = ('_i',)
     _fields_    = [('type', wt.DWORD), ('_i', _I)]
 
-_BTN = {'ld': MOUSEEVENTF_LEFTDOWN,   'lu': MOUSEEVENTF_LEFTUP,
-        'rd': MOUSEEVENTF_RIGHTDOWN,  'ru': MOUSEEVENTF_RIGHTUP,
-        'md': MOUSEEVENTF_MIDDLEDOWN, 'mu': MOUSEEVENTF_MIDDLEUP}
+_BTN = {
+    MouseButton.LEFT_DOWN.value: MOUSEEVENTF_LEFTDOWN,
+    MouseButton.LEFT_UP.value: MOUSEEVENTF_LEFTUP,
+    MouseButton.RIGHT_DOWN.value: MOUSEEVENTF_RIGHTDOWN,
+    MouseButton.RIGHT_UP.value: MOUSEEVENTF_RIGHTUP,
+    MouseButton.MIDDLE_DOWN.value: MOUSEEVENTF_MIDDLEDOWN,
+    MouseButton.MIDDLE_UP.value: MOUSEEVENTF_MIDDLEUP,
+}
 
 # ── Module state ─────────────────────────────────────────────────────────────
 _cfg       = {}
@@ -63,45 +80,62 @@ def _send(inp: INPUT):
     if u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) != 1:
         _log.warning('SendInput returned 0 — injection blocked (UAC/elevated window?)')
 
-def handle(ev: dict):
-    if ev.get('t') not in ('mm',):   # skip spammy mouse-move
-        _log.debug(f'Handle event: {ev}')
+def _handle_key(ev: dict):
     t = ev.get('t')
-    if t in ('kd', 'ku'):
-        i = INPUT(type=1)
-        i.ki = KEYBDINPUT(wVk=ev['vk'], wScan=ev['sc'],
-                          dwFlags=KEYEVENTF_KEYUP if t == 'ku' else 0,
-                          time=0, dwExtraInfo=None)
-        _send(i)
-    elif t == 'mm':
-        i = INPUT(type=0)
-        i.mi = MOUSEINPUT(dx=ev['dx'], dy=ev['dy'], mouseData=0,
-                          dwFlags=MOUSEEVENTF_MOVE, time=0, dwExtraInfo=None)
-        _send(i)
-    elif t == 'mc':
-        i = INPUT(type=0)
-        i.mi = MOUSEINPUT(dx=0, dy=0, mouseData=0,
-                          dwFlags=_BTN.get(ev['b'], 0), time=0, dwExtraInfo=None)
-        _send(i)
-    elif t == 'ms':
-        i = INPUT(type=0)
-        # ponytail: & 0xFFFFFFFF converts negative wheel delta to unsigned DWORD
-        i.mi = MOUSEINPUT(dx=0, dy=0,
-                          mouseData=(ev['dy'] * 120) & 0xFFFFFFFF,
-                          dwFlags=MOUSEEVENTF_WHEEL, time=0, dwExtraInfo=None)
-        _send(i)
+    i = INPUT(type=1)
+    i.ki = KEYBDINPUT(wVk=ev['vk'], wScan=ev['sc'],
+                      dwFlags=KEYEVENTF_KEYUP if t == EventType.KEY_UP.value else 0,
+                      time=0, dwExtraInfo=None)
+    _send(i)
+
+
+def _handle_mouse_move(ev: dict):
+    i = INPUT(type=0)
+    i.mi = MOUSEINPUT(dx=ev['dx'], dy=ev['dy'], mouseData=0,
+                      dwFlags=MOUSEEVENTF_MOVE, time=0, dwExtraInfo=None)
+    _send(i)
+
+
+def _handle_mouse_click(ev: dict):
+    i = INPUT(type=0)
+    i.mi = MOUSEINPUT(dx=0, dy=0, mouseData=0,
+                      dwFlags=_BTN.get(ev['b'], 0), time=0, dwExtraInfo=None)
+    _send(i)
+
+
+def _handle_mouse_scroll(ev: dict):
+    i = INPUT(type=0)
+    i.mi = MOUSEINPUT(dx=0, dy=0,
+                      mouseData=(ev['dy'] * 120) & 0xFFFFFFFF,
+                      dwFlags=MOUSEEVENTF_WHEEL, time=0, dwExtraInfo=None)
+    _send(i)
+
+
+_INPUT_HANDLERS = {
+    EventType.KEY_DOWN.value: _handle_key,
+    EventType.KEY_UP.value: _handle_key,
+    EventType.MOUSE_MOVE.value: _handle_mouse_move,
+    EventType.MOUSE_CLICK.value: _handle_mouse_click,
+    EventType.MOUSE_SCROLL.value: _handle_mouse_scroll,
+}
+
+
+def handle(ev: dict):
+    if ev.get('t') != EventType.MOUSE_MOVE.value:
+        _log.debug(f'Handle event: {ev}')
+    handler = _INPUT_HANDLERS.get(ev.get('t'))
+    if handler:
+        handler(ev)
 
 # ── Return-edge watcher ───────────────────────────────────────────────────────
-_OPPOSITE = {'right': 'left', 'left': 'right', 'top': 'bottom', 'bottom': 'top'}
-
 def _at_return_edge(x: int, y: int) -> bool:
     sw = u32.GetSystemMetrics(0)
     sh = u32.GetSystemMetrics(1)
-    e  = _OPPOSITE.get(_cfg.get('direction', 'right'), 'left')
-    return ((e == 'left'   and x <= 0)        or
-            (e == 'right'  and x >= sw - 1)   or
-            (e == 'top'    and y <= 0)         or
-            (e == 'bottom' and y >= sh - 1))
+    edge = Direction.from_value(_cfg.get('direction')).opposite
+    return ((edge is Direction.LEFT and x <= 0) or
+            (edge is Direction.RIGHT and x >= sw - 1) or
+            (edge is Direction.TOP and y <= 0) or
+            (edge is Direction.BOTTOM and y >= sh - 1))
 
 def _edge_watcher():
     """Poll cursor position; send 'release' to server when at the return edge."""
@@ -113,7 +147,7 @@ def _edge_watcher():
             s = _sock
             if s:
                 try:
-                    s.sendall(json.dumps({'t': 'release'}).encode() + b'\n')
+                    s.sendall(json.dumps({'t': EventType.RELEASE.value}).encode() + b'\n')
                 except OSError:
                     pass
             _stop.wait(0.4)   # debounce: don't spam releases
@@ -121,30 +155,33 @@ def _edge_watcher():
             _stop.wait(0.016) # ~60 Hz
 
 # ── KVM receiver ─────────────────────────────────────────────────────────────
-def _kvm_client():
-    global _sock
-    ip   = _cfg['server_ip']
-    port = _cfg.get('kvm_port', 9000)
-    _notify(f'Connecting to {ip}:{port}…')
+def _close_socket(sock):
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _connect_kvm(ip: str, port: int):
     while not _stop.is_set():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2.0)
             s.connect((ip, port))
             s.settimeout(None)
-            _sock = s
             _log.debug(f'TCP connected to {ip}:{port}')
-            _notify('KVM ready.')
-            break
+            return s
         except (ConnectionRefusedError, socket.timeout, OSError) as e:
             _log.debug(f'Connect attempt failed: {e}')
             _stop.wait(1)
-    if _stop.is_set():
-        return
+    return None
+
+
+def _receive_kvm(sock):
     buf = b''
     while not _stop.is_set():
         try:
-            data = _sock.recv(4096)
+            data = sock.recv(4096)
         except OSError:
             break
         if not data:
@@ -159,45 +196,95 @@ def _kvm_client():
                 except (json.JSONDecodeError, KeyError):
                     pass
 
+
+def _kvm_client():
+    global _sock
+    ip   = _cfg['server_ip']
+    port = _cfg.get('kvm_port', DEFAULT_KVM_PORT)
+    while not _stop.is_set():
+        _notify(f'Connecting to {ip}:{port}…')
+        sock = _connect_kvm(ip, port)
+        if sock is None:
+            return
+        _sock = sock
+        _notify('KVM ready.')
+        _receive_kvm(sock)
+        if sock is _sock:
+            _sock = None
+        _close_socket(sock)
+        if not _stop.is_set():
+            _stop.wait(1)
+
 # ── Audio capture → server ────────────────────────────────────────────────────
-def _find_loopback():
-    """Return (device_index, name) for the first WASAPI loopback input device."""
+def _wasapi_host_index():
     try:
-        wasapi = next(i for i, h in enumerate(sd.query_hostapis()) if 'WASAPI' in h['name'])
+        return next(i for i, h in enumerate(sd.query_hostapis()) if 'WASAPI' in h['name'])
     except StopIteration:
-        return None, 'no WASAPI host'
+        return None
+
+
+def _default_output_device():
+    default = sd.default.device
+    if isinstance(default, (list, tuple)):
+        return default[1]
+    return default
+
+
+def _is_wasapi_output(device_index: int, wasapi: int) -> bool:
+    device = sd.query_devices(device_index)
+    return device['hostapi'] == wasapi and device['max_output_channels'] > 0
+
+
+def _find_loopback_source():
+    """Return (device_index, name, channels) for a WASAPI output loopback source."""
+    wasapi = _wasapi_host_index()
+    if wasapi is None:
+        return None, 'no WASAPI host', 0
+
+    configured = _cfg.get('audio_device')
+    if configured is not None and _is_wasapi_output(configured, wasapi):
+        device = sd.query_devices(configured)
+        return configured, device['name'], min(device['max_output_channels'], AUDIO_CHANNELS)
+
+    default_output = _default_output_device()
+    if default_output is not None and default_output >= 0 and _is_wasapi_output(default_output, wasapi):
+        device = sd.query_devices(default_output)
+        return default_output, device['name'], min(device['max_output_channels'], AUDIO_CHANNELS)
+
     for i, d in enumerate(sd.query_devices()):
-        if d['hostapi'] == wasapi and d['max_input_channels'] > 0:
-            return i, d['name']
-    return None, 'no loopback device found'
+        if d['hostapi'] == wasapi and d['max_output_channels'] > 0:
+            return i, d['name'], min(d['max_output_channels'], AUDIO_CHANNELS)
+    return None, 'no WASAPI output device found', 0
+
+
+def _stereo_audio(indata, src_ch: int):
+    if src_ch == AUDIO_CHANNELS:
+        return indata
+    return np.repeat(indata, AUDIO_CHANNELS, axis=1)
 
 def _audio_thread():
-    dev, dev_name = _find_loopback()
+    dev, dev_name, src_ch = _find_loopback_source()
     if dev is None:
         _notify(f'Audio disabled: {dev_name}')
         return
     ip         = _cfg['server_ip']
-    port       = _cfg.get('audio_port', 9001)
-    dev_info   = sd.query_devices(dev)
-    src_ch     = dev_info['max_input_channels']
-    samplerate = int(dev_info['default_samplerate'])
-    _log.debug(f'Audio loopback: "{dev_name}" idx={dev} ch={src_ch} rate={samplerate}')
+    port       = _cfg.get('audio_port', DEFAULT_AUDIO_PORT)
+    settings   = sd.WasapiSettings(loopback=True)
+    _log.debug(f'Audio loopback: "{dev_name}" idx={dev} ch={src_ch} rate={AUDIO_SAMPLERATE}')
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         def cb(indata, frames, t, status):
             if status:
                 _log.debug(f'Audio stream status: {status}')
-            # normalize to stereo so the server always receives 2-channel data
-            if src_ch == 1:
-                out = np.repeat(indata, 2, axis=1)
-            elif src_ch > 2:
-                out = indata[:, :2].copy()
-            else:
-                out = indata
-            sock.sendto(bytes(out), (ip, port))
+            out = _stereo_audio(indata, src_ch)
+            try:
+                sock.sendto(out.tobytes(), (ip, port))
+            except OSError:
+                pass
         _notify(f'Audio: streaming "{dev_name}" → {ip}:{port}')
-        with sd.InputStream(device=dev, channels=src_ch, samplerate=samplerate,
-                            dtype='int16', blocksize=960, callback=cb):
+        with sd.InputStream(device=dev, channels=src_ch, samplerate=AUDIO_SAMPLERATE,
+                            dtype=AUDIO_DTYPE, blocksize=AUDIO_BLOCK_FRAMES,
+                            callback=cb, extra_settings=settings):
             _stop.wait()
     except Exception as e:
         _notify(f'Audio error: {e}')
@@ -220,10 +307,7 @@ def stop():
     _stop.set()
     s = _sock
     if s:
-        try:
-            s.close()
-        except OSError:
-            pass
+        _close_socket(s)
 
 if __name__ == '__main__':
     ip = sys.argv[1] if len(sys.argv) > 1 else input('Server IP: ').strip()

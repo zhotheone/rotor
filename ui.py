@@ -9,6 +9,8 @@ import socket
 import os, sys, json, logging
 import sounddevice as sd
 
+from protocol import Direction, Mode
+
 # Resolve directory next to the exe (frozen) or script (dev)
 _app_dir     = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__))
 _log_path    = os.path.join(_app_dir, 'rotor.log')
@@ -36,6 +38,7 @@ def _load_modules():
 
 def _audio_devices(mode: str):
     """Return [(label, device_index)] appropriate for the given mode."""
+    selected_mode = Mode.from_value(mode)
     try:
         wasapi = next(i for i, h in enumerate(sd.query_hostapis()) if 'WASAPI' in h['name'])
     except StopIteration:
@@ -43,9 +46,9 @@ def _audio_devices(mode: str):
 
     out = []
     for i, d in enumerate(sd.query_devices()):
-        if mode == 'client':
-            # Only WASAPI input devices (loopback) for capturing system audio
-            if d['hostapi'] == wasapi and d['max_input_channels'] > 0:
+        if selected_mode is Mode.CLIENT:
+            # WASAPI loopback captures an output device as the client's audio source.
+            if d['hostapi'] == wasapi and d['max_output_channels'] > 0:
                 out.append((d['name'], i))
         else:
             # Any output device for playback received audio
@@ -80,10 +83,10 @@ class RotorUI:
 
         # ── Mode ──────────────────────────────────────────────────────────────
         ttk.Label(f, text='Mode:').grid(row=1, column=0, sticky='w', **p)
-        self.mode = tk.StringVar(value='server')
+        self.mode = tk.StringVar(value=Mode.SERVER.value)
         mf = ttk.Frame(f)
         mf.grid(row=1, column=1, sticky='w', **p)
-        for label, val in (('Server', 'server'), ('Client', 'client')):
+        for label, val in (('Server', Mode.SERVER.value), ('Client', Mode.CLIENT.value)):
             ttk.Radiobutton(mf, text=label, variable=self.mode, value=val,
                             command=self._on_mode_change).pack(side='left', padx=(0, 8))
 
@@ -94,7 +97,7 @@ class RotorUI:
         self._ip_entry = ttk.Entry(f, textvariable=self.ip, width=22)
         self._ip_entry.grid(row=2, column=1, sticky='w', **p)
 
-        # ── Audio device (server only — client auto-detects loopback) ────────
+        # ── Audio device ─────────────────────────────────────────────────────
         self._audio_label = ttk.Label(f, text='Audio:')
         self._audio_label.grid(row=3, column=0, sticky='w', **p)
         self.audio_var   = tk.StringVar()
@@ -104,9 +107,9 @@ class RotorUI:
 
         # ── Layout direction ──────────────────────────────────────────────────
         ttk.Label(f, text='Client is to the:').grid(row=4, column=0, sticky='w', **p)
-        self.direction = tk.StringVar(value='right')
+        self.direction = tk.StringVar(value=Direction.RIGHT.value)
         ttk.Combobox(f, textvariable=self.direction, width=10, state='readonly',
-                     values=['right', 'left', 'top', 'bottom']).grid(
+                     values=[direction.value for direction in Direction]).grid(
                      row=4, column=1, sticky='w', **p)
 
         # ── Fullscreen guard ──────────────────────────────────────────────────
@@ -135,18 +138,19 @@ class RotorUI:
 
     def _on_mode_change(self):
         m = self.mode.get()
-        if m == 'server':
+        mode = Mode.from_value(m)
+        if mode is Mode.SERVER:
             self._ip_label.grid_remove()
             self._ip_entry.grid_remove()
-            self._audio_label.grid()
-            self._audio_combo.grid()
+            self._audio_label.config(text='Audio output:')
         else:
             self._ip_label.grid()
             self._ip_entry.grid()
-            self._audio_label.grid_remove()
-            self._audio_combo.grid_remove()
+            self._audio_label.config(text='Audio source:')
+        self._audio_label.grid()
+        self._audio_combo.grid()
         # fullscreen guard only meaningful on server
-        self._fs_check.state(['!disabled'] if m == 'server' else ['disabled'])
+        self._fs_check.state(['!disabled'] if mode is Mode.SERVER else ['disabled'])
         self._refresh_audio()
 
     def _refresh_audio(self):
@@ -179,9 +183,9 @@ class RotorUI:
         try:
             with open(_config_path, encoding='utf-8') as f:
                 c = json.load(f)
-            self.mode.set(c.get('mode', 'server'))
+            self.mode.set(Mode.from_value(c.get('mode')).value)
             self.ip.set(c.get('ip', ''))
-            self.direction.set(c.get('direction', 'right'))
+            self.direction.set(Direction.from_value(c.get('direction')).value)
             self.block_fs.set(c.get('block_fs', True))
             self._saved_audio = c.get('audio', '')
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
@@ -218,7 +222,8 @@ class RotorUI:
     def _do_start(self):
         m   = self.mode.get()
         ip  = self.ip.get().strip()
-        if not ip and m != 'server':
+        mode = Mode.from_value(m)
+        if not ip and mode is not Mode.SERVER:
             self._set_status('Enter an IP address.')
             return
         dev = self._selected_audio_index()
@@ -229,7 +234,7 @@ class RotorUI:
             self._set_status(f'Windows only: {e}')
             return
 
-        if m == 'server':
+        if mode is Mode.SERVER:
             config = {
                 'client_ip':        ip,
                 'audio_device':     dev,
@@ -240,6 +245,7 @@ class RotorUI:
         else:
             config = {
                 'server_ip': ip,
+                'audio_device': dev,
                 'direction': self.direction.get(),
             }
             target = lambda: _client.start(config, on_status=self._set_status)
@@ -251,7 +257,7 @@ class RotorUI:
         self._thread.start()
 
     def _do_stop(self):
-        if self.mode.get() == 'server':
+        if Mode.from_value(self.mode.get()) is Mode.SERVER:
             _server.stop()
         else:
             _client.stop()

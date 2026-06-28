@@ -13,6 +13,19 @@ import ctypes, ctypes.wintypes as wt, socket, threading, json, sys, queue, time,
 import sounddevice as sd
 import numpy as np
 
+from protocol import (
+    AUDIO_BLOCK_FRAMES,
+    AUDIO_CHANNELS,
+    AUDIO_DTYPE,
+    AUDIO_PACKET_BYTES,
+    AUDIO_SAMPLERATE,
+    DEFAULT_AUDIO_PORT,
+    DEFAULT_KVM_PORT,
+    Direction,
+    EventType,
+    MouseButton,
+)
+
 _log = logging.getLogger('server')
 
 u32 = ctypes.windll.user32
@@ -101,20 +114,23 @@ def _is_fullscreen() -> bool:
 
 def _at_trigger_edge(x: int, y: int) -> bool:
     sw, sh = _screen()
-    d = _cfg.get('direction', 'right')
-    return ((d == 'right'  and x >= sw - 1) or
-            (d == 'left'   and x <= 0)       or
-            (d == 'top'    and y <= 0)        or
-            (d == 'bottom' and y >= sh - 1))
+    d = Direction.from_value(_cfg.get('direction'))
+    return ((d is Direction.RIGHT and x >= sw - 1) or
+            (d is Direction.LEFT and x <= 0) or
+            (d is Direction.TOP and y <= 0) or
+            (d is Direction.BOTTOM and y >= sh - 1))
 
 def _lock_xy():
     """Cursor position to hold while in KVM mode (one pixel inside trigger edge)."""
     sw, sh = _screen()
-    d = _cfg.get('direction', 'right')
-    if d == 'right':  return sw - 2, sh // 2
-    if d == 'left':   return 1,       sh // 2
-    if d == 'top':    return sw // 2, 1
-    return                   sw // 2, sh - 2    # bottom
+    d = Direction.from_value(_cfg.get('direction'))
+    if d is Direction.RIGHT:
+        return sw - 2, sh // 2
+    if d is Direction.LEFT:
+        return 1, sh // 2
+    if d is Direction.TOP:
+        return sw // 2, 1
+    return sw // 2, sh - 2
 
 def _warp(x: int, y: int):
     sw, sh = _screen()
@@ -144,14 +160,23 @@ def _kb_hook(nCode, wParam, lParam):
         s = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
         if not (s.flags & LLKHF_INJECTED) and _active:
             down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
-            _send({'t': 'kd' if down else 'ku', 'vk': s.vkCode, 'sc': s.scanCode})
+            _send({
+                't': EventType.KEY_DOWN.value if down else EventType.KEY_UP.value,
+                'vk': s.vkCode,
+                'sc': s.scanCode,
+            })
             return 1     # suppress locally while in KVM mode
     return u32.CallNextHookEx(None, nCode, wParam, lParam)
 
 # ── Mouse hook ───────────────────────────────────────────────────────────────
-_BTN = {WM_LBUTTONDOWN: 'ld', WM_LBUTTONUP: 'lu',
-        WM_RBUTTONDOWN: 'rd', WM_RBUTTONUP: 'ru',
-        WM_MBUTTONDOWN: 'md', WM_MBUTTONUP: 'mu'}
+_BTN = {
+    WM_LBUTTONDOWN: MouseButton.LEFT_DOWN.value,
+    WM_LBUTTONUP: MouseButton.LEFT_UP.value,
+    WM_RBUTTONDOWN: MouseButton.RIGHT_DOWN.value,
+    WM_RBUTTONUP: MouseButton.RIGHT_UP.value,
+    WM_MBUTTONDOWN: MouseButton.MIDDLE_DOWN.value,
+    WM_MBUTTONUP: MouseButton.MIDDLE_UP.value,
+}
 
 def _ms_hook(nCode, wParam, lParam):
     global _last_edge_log
@@ -180,17 +205,30 @@ def _ms_hook(nCode, wParam, lParam):
                 if wParam == WM_MOUSEMOVE:
                     dx, dy = x - lx, y - ly
                     if dx or dy:
-                        _send({'t': 'mm', 'dx': dx, 'dy': dy})
+                        _send({'t': EventType.MOUSE_MOVE.value, 'dx': dx, 'dy': dy})
                         _warp(lx, ly)
                 elif wParam in _BTN:
-                    _send({'t': 'mc', 'b': _BTN[wParam]})
+                    _send({'t': EventType.MOUSE_CLICK.value, 'b': _BTN[wParam]})
                 elif wParam == WM_MOUSEWHEEL:
                     dy = ctypes.c_short(s.mouseData >> 16).value // 120
-                    _send({'t': 'ms', 'dy': dy})
+                    _send({'t': EventType.MOUSE_SCROLL.value, 'dy': dy})
                 return 1     # suppress all mouse input in KVM mode
     return u32.CallNextHookEx(None, nCode, wParam, lParam)
 
 # ── Background threads ───────────────────────────────────────────────────────
+def _clear_connection(conn):
+    global _conn
+    if conn is _conn:
+        _conn = None
+        if _active:
+            _set_active(False)
+        _notify('Client disconnected.')
+    try:
+        conn.close()
+    except OSError:
+        pass
+
+
 def _kvm_sender():
     global _conn
     while not _stop.is_set():
@@ -202,11 +240,11 @@ def _kvm_sender():
         if c:
             try:
                 c.sendall(json.dumps(ev).encode() + b'\n')
-                if ev.get('t') not in ('mm',):   # skip spammy mouse-move
+                if ev.get('t') != EventType.MOUSE_MOVE.value:
                     _log.debug(f'Sent event: {ev}')
             except OSError as e:
                 _log.warning(f'TCP send failed: {e}')
-                _conn = None
+                _clear_connection(c)
 
 def _kvm_receiver():
     """Read 'release' signals sent back by the client."""
@@ -227,17 +265,19 @@ def _kvm_receiver():
                     if line:
                         try:
                             ev = json.loads(line)
-                            if ev.get('t') == 'release' and _active:
+                            if ev.get('t') == EventType.RELEASE.value and _active:
                                 _log.debug('Release received from client')
                                 _set_active(False)
                         except json.JSONDecodeError:
                             pass
         except OSError:
             pass
+        finally:
+            _clear_connection(c)
 
 def _kvm_server():
     global _conn
-    port = _cfg.get('kvm_port', 9000)
+    port = _cfg.get('kvm_port', DEFAULT_KVM_PORT)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.settimeout(1.0)
@@ -246,6 +286,9 @@ def _kvm_server():
     while not _stop.is_set():
         try:
             conn, addr = srv.accept()
+            old_conn = _conn
+            if old_conn:
+                _clear_connection(old_conn)
             _cfg['client_ip'] = addr[0]
             _notify(f'Connected to {addr[0]}')
             _conn = conn
@@ -256,24 +299,36 @@ def _kvm_server():
 def _audio_thread():
     dev  = _cfg.get('audio_device')
     if dev is None:
+        _notify('Audio disabled: no playback device selected.')
         return
-    port = _cfg.get('audio_port', 9001)
+    port = _cfg.get('audio_port', DEFAULT_AUDIO_PORT)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(('', port))
-    sock.settimeout(1.0)
-    stream = sd.OutputStream(device=dev, channels=2, samplerate=48000,
-                              dtype='int16', blocksize=960)
-    stream.start()
-    while not _stop.is_set():
-        try:
-            data, _ = sock.recvfrom(960 * 4)
-            stream.write(np.frombuffer(data, dtype='int16').reshape(-1, 2))
-        except socket.timeout:
-            pass
-        except Exception:
-            pass
-    stream.stop()
-    sock.close()
+    stream = None
+    try:
+        sock.bind(('', port))
+        sock.settimeout(1.0)
+        stream = sd.OutputStream(device=dev, channels=AUDIO_CHANNELS,
+                                 samplerate=AUDIO_SAMPLERATE, dtype=AUDIO_DTYPE,
+                                 blocksize=AUDIO_BLOCK_FRAMES)
+        stream.start()
+        _notify(f'Audio: listening on UDP {port}.')
+        while not _stop.is_set():
+            try:
+                data, _ = sock.recvfrom(AUDIO_PACKET_BYTES)
+                stream.write(np.frombuffer(data, dtype=AUDIO_DTYPE).reshape(-1, AUDIO_CHANNELS))
+            except socket.timeout:
+                pass
+            except ValueError as e:
+                _log.debug(f'Dropped malformed audio packet: {e}')
+            except Exception as e:
+                _log.debug(f'Audio receive error: {e}')
+    except Exception as e:
+        _notify(f'Audio error: {e}')
+    finally:
+        if stream:
+            stream.stop()
+            stream.close()
+        sock.close()
 
 # ── Hook message loop (must run on the thread that installs the hooks) ────────
 def _hook_loop():
@@ -286,6 +341,13 @@ def _hook_loop():
     hms  = u32.SetWindowsHookExW(WH_MOUSE_LL,    _ms_fn, hmod, 0)
     _log.debug(f'Hooks installed: kb={hkb} ms={hms}')
     _hook_ready.set()
+    if not hkb or not hms:
+        _notify('Input hook error: keyboard or mouse hook was not installed.')
+        if hkb:
+            u32.UnhookWindowsHookEx(hkb)
+        if hms:
+            u32.UnhookWindowsHookEx(hms)
+        return
     msg = wt.MSG()
     while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
         u32.TranslateMessage(ctypes.byref(msg))
@@ -306,12 +368,14 @@ def start(config: dict, on_status=None):
     for fn in (_kvm_server, _kvm_sender, _kvm_receiver, _audio_thread):
         threading.Thread(target=fn, daemon=True).start()
     local_ip = socket.gethostbyname(socket.gethostname())
-    d = config.get('direction', 'right')
     _notify(f'Server running on {local_ip} — waiting for connection…')
     _hook_loop()   # blocks until stop() posts WM_QUIT
 
 def stop():
     _stop.set()
+    c = _conn
+    if c:
+        _clear_connection(c)
     _hook_ready.wait(timeout=2.0)
     if _hook_tid:
         u32.PostThreadMessageW(_hook_tid, WM_QUIT, 0, 0)
